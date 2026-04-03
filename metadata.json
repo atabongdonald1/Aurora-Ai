@@ -1,0 +1,8 @@
+{
+  "name": "AURORA STUDIO AI",
+  "description": "Autonomous AI Video Production Studio for Hollywood-level cinematic content.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

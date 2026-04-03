@@ -1,0 +1,61 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "A user of the application",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "The unique ID of the user" },
+        "email": { "type": "string", "description": "The email address of the user" },
+        "displayName": { "type": "string", "description": "The display name of the user" },
+        "photoURL": { "type": "string", "description": "The photo URL of the user" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When the user was created" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Production": {
+      "title": "Production",
+      "description": "A video production project",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "The ID of the user who owns this production" },
+        "title": { "type": "string", "description": "The title of the production" },
+        "genre": { "type": "string", "description": "The genre of the production" },
+        "status": { "type": "string", "description": "The current status of the production" },
+        "script": { "type": "string", "description": "The generated script" },
+        "lyrics": { "type": "string", "description": "The generated lyrics" },
+        "storyboard": { "type": "array", "description": "The scene-by-scene breakdown" },
+        "characterTokens": { "type": "string", "description": "The character design tokens" },
+        "musicPlan": { "type": "string", "description": "The music production plan" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When the production was created" }
+      },
+      "required": ["userId", "title", "createdAt"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A message in a chat conversation",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "The ID of the user" },
+        "role": { "type": "string", "enum": ["user", "model"], "description": "The role of the message sender" },
+        "content": { "type": "string", "description": "The content of the message" },
+        "timestamp": { "type": "string", "format": "date-time", "description": "When the message was sent" }
+      },
+      "required": ["userId", "role", "content", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile data"
+    },
+    "/productions/{productionId}": {
+      "schema": "Production",
+      "description": "Video production projects"
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": "ChatMessage",
+      "description": "Messages in a production assistant chat"
+    }
+  }
+}

@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required) - The unique ID of the user
+    //   - email: string (required) - The email address of the user
+    //   - displayName: string (optional) - The display name of the user
+    //   - photoURL: string (optional) - The photo URL of the user
+    //   - createdAt: timestamp (required) - When the user was created
+    //
+    // Collection: productions
+    // Document ID: {productionId}
+    // Fields:
+    //   - userId: string (required) - The ID of the user who owns this production
+    //   - title: string (required) - The title of the production
+    //   - genre: string (optional) - The genre of the production
+    //   - status: string (optional) - The current status of the production
+    //   - script: string (optional) - The generated script
+    //   - lyrics: string (optional) - The generated lyrics
+    //   - storyboard: list (optional) - The scene-by-scene breakdown
+    //   - characterTokens: string (optional) - The character design tokens
+    //   - musicPlan: string (optional) - The music production plan
+    //   - createdAt: timestamp (required) - When the production was created
+    //
+    // Collection: chats/{chatId}/messages
+    // Document ID: {messageId}
+    // Fields:
+    //   - userId: string (required) - The ID of the user
+    //   - role: string (required) - The role of the message sender (user/model)
+    //   - content: string (required) - The content of the message
+    //   - timestamp: timestamp (required) - When the message was sent
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+             data.uid == request.auth.uid &&
+             isValidEmail(data.email) &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidProduction(data) {
+      return data.keys().hasAll(['userId', 'title', 'createdAt']) &&
+             data.userId == request.auth.uid &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 500 &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['userId', 'role', 'content', 'timestamp']) &&
+             data.userId == request.auth.uid &&
+             data.role in ['user', 'model'] &&
+             data.content is string && data.content.size() > 0 && data.content.size() < 10000 &&
+             data.timestamp is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) && 
+                      request.resource.data.uid == resource.data.uid &&
+                      request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    match /productions/{productionId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated() && isValidProduction(request.resource.data);
+      allow update: if isAuthenticated() && isDocOwner() && isValidProduction(request.resource.data) &&
+                      request.resource.data.userId == resource.data.userId &&
+                      request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if isAuthenticated() && isDocOwner();
+    }
+
+    match /chats/{chatId}/messages/{messageId} {
+      allow read: if isAuthenticated() && (chatId == request.auth.uid || chatId.startsWith(request.auth.uid));
+      allow create: if isAuthenticated() && isValidMessage(request.resource.data);
+    }
+  }
+}
