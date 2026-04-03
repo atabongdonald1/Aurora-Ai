@@ -20,12 +20,21 @@ import { auth, db, signInWithGoogle, logout, OperationType, handleFirestoreError
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, addDoc, query, where, onSnapshot, orderBy, serverTimestamp, doc, setDoc, deleteDoc, getDocs, updateDoc, getDoc } from 'firebase/firestore';
 
-const getAI = () => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const getAI = () => {
+  // Prefer process.env.API_KEY which is used for paid/selected keys, 
+  // fallback to GEMINI_API_KEY for free models.
+  const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
+  return new GoogleGenAI({ apiKey });
+};
 
 const isRetryableError = (error: any) => {
   const errorMsg = error?.message || String(error);
-  // Hard quota/spending cap errors should NOT be retried as they require manual intervention
-  if (errorMsg.includes('spending cap') || errorMsg.includes('billing details')) {
+  // Hard spending cap errors should NOT be retried as they require manual intervention
+  if (errorMsg.includes('spending cap')) {
+    return false;
+  }
+  // Permission denied (403) is usually not retryable without user action (selecting a key)
+  if (errorMsg.includes('403') || errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('does not have permission') || errorMsg.includes('Requested entity was not found')) {
     return false;
   }
   return (
@@ -464,7 +473,7 @@ export default function App() {
     try {
       const previewPromises = [0, 1, 2].map(v => 
         generateContentWithRetry({
-          model: 'gemini-3-pro-image-preview',
+          model: 'gemini-3.1-flash-image-preview',
           contents: {
             parts: [{ text: `Masterpiece cinematic film still, variation ${v + 1}, 8k, ${scene.visualPrompt}, character: ${state.characterTokens}, lighting: ${scene.lighting}` }]
           },
@@ -500,8 +509,12 @@ export default function App() {
         });
         addLog('VIDEO GENERATION', `Scene ${sceneIndex + 1} previews updated.`);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error generating scene previews:", error);
+      const errorMsg = error?.message || String(error);
+      if (errorMsg.includes('403') || errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('does not have permission') || errorMsg.includes('Requested entity was not found')) {
+        setHasApiKey(false);
+      }
       addLog('SYSTEM', `Failed to generate previews for Scene ${sceneIndex + 1}.`);
     }
   };
@@ -574,8 +587,12 @@ export default function App() {
       });
       
       addLog('STORYBOARD ARTIST', `Scene ${sceneIndex + 1} details refined by AI.`);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error generating scene details:", error);
+      const errorMsg = error?.message || String(error);
+      if (errorMsg.includes('403') || errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('does not have permission') || errorMsg.includes('Requested entity was not found')) {
+        setHasApiKey(false);
+      }
       addLog('SYSTEM', `Failed to generate details for Scene ${sceneIndex + 1}.`);
       
       // Reset refining state on error
@@ -629,18 +646,20 @@ export default function App() {
       let script = '';
       let lyrics = '';
 
-      // 1. SCRIPTWRITING / SONGWRITING (Using Flash Lite for cost efficiency)
-      addLog('SCRIPTWRITER', 'Crafting narrative structure with Flash Intelligence...');
+      // 1. SCRIPTWRITING / SONGWRITING (Using Pro with High Thinking for premium quality)
+      addLog('SCRIPTWRITER', 'Crafting narrative structure with Deep Reasoning Pro Intelligence...');
       const scriptResponse = await generateContentWithRetry({
-        model: "gemini-3.1-flash-lite-preview",
+        model: "gemini-3.1-pro-preview",
         contents: `Act as a Hollywood Scriptwriter and Creative Director. 
-        Create a detailed ${input.isMusicVideoMode ? 'song structure and lyrics' : 'script'} for a ${input.duration} minute ${input.genre} video titled "${input.concept}". 
+        Create a detailed, high-fidelity ${input.isMusicVideoMode ? 'song structure and lyrics' : 'script'} for a ${input.duration} minute ${input.genre} video titled "${input.concept}". 
         Audience: ${input.audience}. 
-        ${input.isMusicVideoMode ? 'Structure: Intro, Verse 1, Chorus, Verse 2, Chorus, Bridge, Chorus, Outro.' : 'Include scenes with dialogue, narration, and emotional cues.'}
+        ${input.isMusicVideoMode ? 'Structure: Intro, Verse 1, Chorus, Verse 2, Chorus, Bridge, Chorus, Outro.' : 'Include scenes with sophisticated dialogue, narration, and deep emotional cues.'}
         Use Search Grounding to ensure technical accuracy and cultural relevance.
+        Focus on premium cinematic storytelling, character depth, and atmospheric world-building.
         Format as Markdown.`,
         config: {
-          tools: [{ googleSearch: {} }]
+          tools: [{ googleSearch: {} }],
+          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
         }
       });
       script = scriptResponse.text || '';
@@ -649,11 +668,11 @@ export default function App() {
       setState(prev => ({ ...prev, script, lyrics, status: 'storyboarding' }));
       addLog('SCRIPTWRITER', 'Script finalized with Grounded Intelligence.');
 
-      // 2. STORYBOARDING (Using Flash Lite for cost efficiency)
-      addLog('STORYBOARD ARTIST', `Breaking down ${input.isMusicVideoMode ? 'lyrics' : 'script'} into visual scenes...`);
+      // 2. STORYBOARDING (Using Pro with High Thinking for premium quality)
+      addLog('STORYBOARD ARTIST', `Breaking down ${input.isMusicVideoMode ? 'lyrics' : 'script'} into visual scenes with Deep Reasoning...`);
       const storyboardResponse = await generateContentWithRetry({
-        model: "gemini-3.1-flash-lite-preview",
-        contents: `Act as a Storyboard Artist. Based on this ${input.isMusicVideoMode ? 'lyrics' : 'script'}, create a scene-by-scene breakdown.
+        model: "gemini-3.1-pro-preview",
+        contents: `Act as a Storyboard Artist. Based on this ${input.isMusicVideoMode ? 'lyrics' : 'script'}, create a scene-by-scene breakdown with high-fidelity visual descriptions.
         ${input.isMusicVideoMode ? 'MUSIC VIDEO MODE: Alternate between "Performance" and "Storytelling" scenes.' : ''}
         Content: ${script}
         Return a JSON array of scenes with: id, description, visualPrompt, cameraMovement, lighting, duration, sectionType, isPerformance, soundDesignPrompt, transitionType, ambiencePreset, sfxPreset.
@@ -674,6 +693,7 @@ export default function App() {
         - 'Cut': Fast-paced action or standard narrative beats.`,
         config: {
           responseMimeType: "application/json",
+          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
           responseSchema: {
             type: GeminiType.ARRAY,
             items: {
@@ -714,8 +734,8 @@ export default function App() {
       setState(prev => ({ ...prev, storyboard, status: 'designing_characters' }));
       addLog('STORYBOARD ARTIST', `Generated ${storyboard.length} scenes.`);
 
-      // 3. CHARACTER DESIGN
-      addLog('CHARACTER DESIGN', 'Defining visual identity tokens for character consistency...');
+      // 3. CHARACTER DESIGN (Using Pro with High Thinking for premium quality)
+      addLog('CHARACTER DESIGN', 'Defining visual identity tokens with Deep Reasoning...');
       const characterResponse = await generateContentWithRetry({
         model: "gemini-3.1-pro-preview",
         contents: `Act as a Lead Character Designer. Analyze the following script and define the visual identity for the main characters.
@@ -728,6 +748,9 @@ export default function App() {
         
         The goal is to provide a concise but highly descriptive prompt fragment that can be used to maintain visual consistency across different scenes.
         Return the tokens as a clear, descriptive text block.`,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
+        }
       });
       const characterTokens = characterResponse.text || '';
       setState(prev => ({ ...prev, characterTokens, status: 'generating_music' }));
@@ -800,72 +823,99 @@ export default function App() {
       });
       addLog('VOICE DIRECTOR', `Voice tracks ready using ${input.voiceName} signature.`);
 
-      // 6. ASSET GENERATION (High-Quality Images & Video)
+      // 6. ASSET GENERATION (Parallelized for Speed & Upgraded for Quality)
       setState(prev => ({ ...prev, status: 'generating_assets' }));
       const updatedStoryboard = [...storyboard];
       
-      for (let i = 0; i < Math.min(storyboard.length, 6); i++) {
+      // Process scenes in parallel with a concurrency limit of 2 to balance speed and quota
+      const processScene = async (i: number) => {
         const startTime = Date.now();
-        addLog('VIDEO GENERATION', `Rendering Scene ${i + 1} (4K Studio Quality)...`);
+        addLog('VIDEO GENERATION', `Scene ${i + 1}: Initiating Studio Quality Render...`);
         
-        // Image Generation (Studio Quality) - Single Preview to conserve quota
-        addLog('VIDEO GENERATION', `Generating visual preview for Scene ${i + 1}...`);
-        
-        const previewPromises = [0].map(v => 
-          generateContentWithRetry({
-            model: 'gemini-3-pro-image-preview',
+        try {
+          // Image Generation (Studio Quality)
+          const imgRes = await generateContentWithRetry({
+            model: 'gemini-3.1-flash-image-preview',
             contents: {
-              parts: [{ text: `Masterpiece cinematic film still, 8k, ${storyboard[i].visualPrompt}, character: ${characterTokens}, lighting: ${storyboard[i].lighting}` }]
+              parts: [{ text: `Masterpiece cinematic film still, 8k, ultra-detailed, ${storyboard[i].visualPrompt}, character: ${characterTokens}, lighting: ${storyboard[i].lighting}, high-end cinematography` }]
             },
             config: {
               imageConfig: { aspectRatio: "16:9", imageSize: "1K" }
             }
-          })
-        );
-
-        const imgResponses = await Promise.all(previewPromises);
-        const previews: string[] = imgResponses
-          .map(res => res.candidates?.[0]?.content?.parts.find(p => p.inlineData))
-          .filter(p => p?.inlineData)
-          .map(p => `data:image/png;base64,${p!.inlineData!.data}`);
-
-        if (previews.length > 0) {
-          updatedStoryboard[i].previews = previews;
-          updatedStoryboard[i].selectedPreviewIndex = 0;
-          updatedStoryboard[i].imageUrl = previews[0];
-          
-          // Animate Selected Image to Video (Veo)
-          addLog('VIDEO GENERATION', `Animating Scene ${i + 1} with Veo (Studio Quality)...`);
-          const selectedImageBase64 = previews[0].split(',')[1];
-          let videoOp = await generateVideosWithRetry({
-            model: 'veo-3.1-generate-preview',
-            prompt: `Cinematic motion, ${storyboard[i].cameraMovement}, ${storyboard[i].description}`,
-            image: { imageBytes: selectedImageBase64, mimeType: 'image/png' },
-            config: { numberOfVideos: 1, resolution: '720p', aspectRatio: '16:9' }
           });
 
-          while (!videoOp.done) {
-            await new Promise(r => setTimeout(r, 5000)); // Longer poll interval for stability
-            videoOp = await getVideosOperationWithRetry({ operation: videoOp });
-          }
-          
-          if (videoOp.response?.generatedVideos?.[0]?.video?.uri) {
-            const videoRes = await fetch(videoOp.response.generatedVideos[0].video.uri, {
-              headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY! }
+          const preview = imgRes.candidates?.[0]?.content?.parts.find(p => p.inlineData);
+          if (preview?.inlineData) {
+            const imageUrl = `data:image/png;base64,${preview.inlineData.data}`;
+            
+            // Update state immediately for visual feedback
+            setState(prev => {
+              const newStoryboard = [...prev.storyboard];
+              newStoryboard[i] = {
+                ...newStoryboard[i],
+                previews: [imageUrl],
+                selectedPreviewIndex: 0,
+                imageUrl: imageUrl
+              };
+              return { ...prev, storyboard: newStoryboard };
             });
-            const videoBlob = await videoRes.blob();
-            updatedStoryboard[i].videoUrl = URL.createObjectURL(videoBlob);
-          }
 
-          const endTime = Date.now();
-          updatedStoryboard[i].generationTime = endTime - startTime;
-          setState(prev => ({ ...prev, storyboard: [...updatedStoryboard] }));
+            // Animate Selected Image to Video (Upgraded to Full Veo for Quality)
+            addLog('VIDEO GENERATION', `Scene ${i + 1}: Animating with Veo Studio (High Fidelity)...`);
+            const selectedImageBase64 = preview.inlineData.data;
+            let videoOp = await generateVideosWithRetry({
+              model: 'veo-3.1-generate-preview',
+              prompt: `High-fidelity cinematic motion, ${storyboard[i].cameraMovement}, ${storyboard[i].description}, photorealistic, 8k resolution`,
+              image: { imageBytes: selectedImageBase64, mimeType: 'image/png' },
+              config: { numberOfVideos: 1, resolution: '1080p', aspectRatio: '16:9' }
+            });
 
-          // Mandatory Cooldown between scenes to prevent rate limit exhaustion
-          if (i < Math.min(storyboard.length, 6) - 1) {
-            addLog('SYSTEM', `Cooling down production pipeline for 10s...`);
-            await new Promise(r => setTimeout(r, 10000));
+            while (!videoOp.done) {
+              await new Promise(r => setTimeout(r, 5000));
+              videoOp = await getVideosOperationWithRetry({ operation: videoOp });
+            }
+            
+            if (videoOp.response?.generatedVideos?.[0]?.video?.uri) {
+              const videoRes = await fetch(videoOp.response.generatedVideos[0].video.uri, {
+                headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY! }
+              });
+              const videoBlob = await videoRes.blob();
+              const videoUrl = URL.createObjectURL(videoBlob);
+              
+              const endTime = Date.now();
+              setState(prev => {
+                const newStoryboard = [...prev.storyboard];
+                newStoryboard[i] = {
+                  ...newStoryboard[i],
+                  videoUrl,
+                  generationTime: endTime - startTime
+                };
+                return { ...prev, storyboard: newStoryboard };
+              });
+              
+              updatedStoryboard[i] = { ...updatedStoryboard[i], videoUrl, imageUrl, generationTime: endTime - startTime };
+              addLog('VIDEO GENERATION', `Scene ${i + 1}: Render Complete.`);
+            }
           }
+        } catch (err: any) {
+          console.error(`Error in Scene ${i + 1}:`, err);
+          addLog('QUALITY CONTROL', `Scene ${i + 1}: Render failed. ${err.message || ''}`);
+        }
+      };
+
+      // Run scenes in batches of 2
+      for (let i = 0; i < Math.min(storyboard.length, 6); i += 2) {
+        const batch = [];
+        batch.push(processScene(i));
+        if (i + 1 < Math.min(storyboard.length, 6)) {
+          batch.push(processScene(i + 1));
+        }
+        await Promise.all(batch);
+        
+        // Small cooldown between batches
+        if (i + 2 < Math.min(storyboard.length, 6)) {
+          addLog('SYSTEM', 'Optimizing pipeline for next batch...');
+          await new Promise(r => setTimeout(r, 5000));
         }
       }
 
@@ -916,10 +966,21 @@ export default function App() {
       addLog('EXECUTIVE PRODUCER', 'Production Complete.');
       saveProduction({ ...state, storyboard: updatedStoryboard, status: 'completed' });
 
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      setState(prev => ({ ...prev, status: 'error' }));
-      addLog('QUALITY CONTROL', 'Critical production failure.');
+      const errorMsg = error?.message || String(error);
+      
+      if (errorMsg.includes('403') || errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('does not have permission') || errorMsg.includes('Requested entity was not found')) {
+        addLog('QUALITY CONTROL', 'Permission Denied: Your API key does not have access to these models.');
+        setHasApiKey(false); // Trigger the API key selection screen
+      } else if (errorMsg.includes('spending cap') || errorMsg.includes('billing details')) {
+        addLog('QUALITY CONTROL', 'Spending Cap Exceeded: Your Google Cloud project has reached its budget limit.');
+        addLog('SYSTEM', 'Please visit https://console.cloud.google.com/billing to raise your cap or check your payment method.');
+        setState(prev => ({ ...prev, status: 'error' }));
+      } else {
+        setState(prev => ({ ...prev, status: 'error' }));
+        addLog('QUALITY CONTROL', 'Critical production failure.');
+      }
     }
   };
 
@@ -945,7 +1006,7 @@ export default function App() {
       }));
 
       const response = await generateContentWithRetry({
-        model: "gemini-3.1-pro-preview",
+        model: "gemini-3-flash-preview",
         contents: [...history, { role: 'user', parts: [{ text: chatInput }] }],
         config: {
           systemInstruction: "You are the Aurora Studio AI Production Assistant. Help the user with script ideas, technical advice, and production management.",
@@ -960,8 +1021,13 @@ export default function App() {
       };
 
       await addDoc(collection(db, 'chats', user.uid, 'messages'), modelMsg);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `chats/${user.uid}/messages`);
+    } catch (err: any) {
+      const errorMsg = err?.message || String(err);
+      if (errorMsg.includes('403') || errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('does not have permission') || errorMsg.includes('Requested entity was not found')) {
+        setHasApiKey(false);
+      } else {
+        handleFirestoreError(err, OperationType.WRITE, `chats/${user.uid}/messages`);
+      }
     } finally {
       setIsChatLoading(false);
     }
