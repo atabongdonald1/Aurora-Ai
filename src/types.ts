@@ -38,9 +38,22 @@ export type ProductionStatus =
   | 'completed' 
   | 'error';
 
+export interface UserProfile {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL: string;
+  plan: 'free' | 'pro' | 'enterprise';
+  credits: number;
+  subscriptionStatus?: string;
+  createdAt: any;
+}
+
 export interface ProductionState {
   id?: string;
   userId?: string;
+  plan?: 'free' | 'pro' | 'enterprise';
+  creditsUsed?: number;
   title: string;
   genre: string;
   duration: string;
@@ -81,6 +94,7 @@ export interface ProductionState {
     };
   };
   createdAt?: any;
+  updatedAt?: any;
 }
 
 export type AgentType = 

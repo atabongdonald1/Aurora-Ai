@@ -15,7 +15,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI, Type as GeminiType, Modality, ThinkingLevel } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { cn } from './lib/utils';
-import { ProductionState, Scene, AgentType, ChatMessage, ProductionStatus } from './types';
+import { storageService } from './lib/storage';
+import { ProductionState, Scene, AgentType, ChatMessage, ProductionStatus, UserProfile } from './types';
 import { auth, db, signInWithGoogle, logout, OperationType, handleFirestoreError } from './firebase';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, addDoc, query, where, onSnapshot, orderBy, serverTimestamp, doc, setDoc, deleteDoc, getDocs, updateDoc, getDoc } from 'firebase/firestore';
@@ -43,7 +44,8 @@ const isRetryableError = (error: any) => {
     errorMsg.includes('UNAVAILABLE') ||
     errorMsg.includes('429') ||
     errorMsg.includes('RESOURCE_EXHAUSTED') ||
-    errorMsg.includes('Quota exceeded')
+    errorMsg.includes('Quota exceeded') ||
+    errorMsg.includes('rate limit')
   );
 };
 
@@ -54,7 +56,21 @@ const generateContentWithRetry = async (params: any, maxRetries = 5) => {
       return await getAI().models.generateContent(params);
     } catch (error: any) {
       lastError = error;
+      const errorMsg = error?.message || String(error);
+      
       if (isRetryableError(error)) {
+        // If we've retried and still getting 429/Quota errors, try falling back to Flash
+        if (i >= 1 && (errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('Quota exceeded'))) {
+          if (params.model === 'gemini-3.1-pro-preview') {
+            console.warn(`[SYSTEM] Pro model quota exhausted. Falling back to Flash model for attempt ${i + 1}...`);
+            params.model = 'gemini-3-flash-preview';
+            // Flash models don't support high thinking levels in the same way or might have different config needs
+            if (params.config?.thinkingConfig) {
+              delete params.config.thinkingConfig;
+            }
+          }
+        }
+
         const delay = Math.pow(2, i) * 2000 + Math.random() * 1000;
         console.warn(`Gemini API error (Retryable), retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -112,7 +128,20 @@ const generateContentStreamWithRetry = async (params: any, maxRetries = 5) => {
       return await getAI().models.generateContentStream(params);
     } catch (error: any) {
       lastError = error;
+      const errorMsg = error?.message || String(error);
+      
       if (isRetryableError(error)) {
+        // If we've retried and still getting 429/Quota errors, try falling back to Flash
+        if (i >= 1 && (errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('Quota exceeded'))) {
+          if (params.model === 'gemini-3.1-pro-preview') {
+            console.warn(`[SYSTEM] Pro model quota exhausted. Falling back to Flash model for attempt ${i + 1}...`);
+            params.model = 'gemini-3-flash-preview';
+            if (params.config?.thinkingConfig) {
+              delete params.config.thinkingConfig;
+            }
+          }
+        }
+
         const delay = Math.pow(2, i) * 2000 + Math.random() * 1000;
         console.warn(`Gemini Stream API error (Retryable), retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -201,6 +230,71 @@ export default function App() {
     }
   });
 
+  // Asset Cache Loader
+  useEffect(() => {
+    if (!state.id || state.storyboard.length === 0) return;
+
+    const loadCachedAssets = async () => {
+      let updated = false;
+      const newStoryboard = [...state.storyboard];
+
+      for (let i = 0; i < newStoryboard.length; i++) {
+        const scene = newStoryboard[i];
+        // If videoUrl is missing or is a blob URL from a previous session (which would be invalid)
+        // Note: blob URLs are session-specific, so if we just loaded the state from Firestore, 
+        // the videoUrl would likely be empty or a stale blob URL.
+        if (!scene.videoUrl || scene.videoUrl.startsWith('blob:')) {
+          const cacheKey = `${state.id}_scene_${i}_video`;
+          try {
+            const cachedBlob = await storageService.getAsset(cacheKey);
+            if (cachedBlob) {
+              newStoryboard[i] = {
+                ...scene,
+                videoUrl: URL.createObjectURL(cachedBlob)
+              };
+              updated = true;
+            }
+          } catch (err) {
+            console.error("Error loading cached asset:", err);
+          }
+        }
+      }
+
+      if (updated) {
+        setState(prev => ({ ...prev, storyboard: newStoryboard }));
+      }
+    };
+
+    loadCachedAssets();
+  }, [state.id]);
+
+  // Asset Cache Saver
+  useEffect(() => {
+    if (!state.id || state.storyboard.length === 0) return;
+
+    const saveAssetsToCache = async () => {
+      for (let i = 0; i < state.storyboard.length; i++) {
+        const scene = state.storyboard[i];
+        if (scene.videoUrl && scene.videoUrl.startsWith('blob:')) {
+          const cacheKey = `${state.id}_scene_${i}_video`;
+          try {
+            const alreadyCached = await storageService.getAsset(cacheKey);
+            if (!alreadyCached) {
+              const res = await fetch(scene.videoUrl);
+              const blob = await res.blob();
+              await storageService.saveAsset(cacheKey, blob);
+              console.log(`Cached asset for scene ${i}`);
+            }
+          } catch (err) {
+            console.error("Error caching asset:", err);
+          }
+        }
+      }
+    };
+
+    saveAssetsToCache();
+  }, [state.id, state.storyboard]);
+
   const [input, setInput] = useState({
     concept: '',
     genre: 'Cinematic Sci-Fi',
@@ -213,7 +307,8 @@ export default function App() {
 
   // UI State
   const [currentSceneIndex, setCurrentSceneIndex] = useState(0);
-  const [activeTab, setActiveTab] = useState<'script' | 'storyboard' | 'chat' | 'history' | 'analytics' | 'characters' | 'post-production' | 'vfx' | 'music'>('script');
+  const [activeTab, setActiveTab] = useState<'script' | 'storyboard' | 'chat' | 'history' | 'analytics' | 'characters' | 'post-production' | 'vfx' | 'music' | 'pricing'>('script');
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
@@ -232,20 +327,26 @@ export default function App() {
       if (u) {
         // Ensure user document exists in Firestore
         const userRef = doc(db, 'users', u.uid);
-        try {
-          const userSnap = await getDoc(userRef);
-          if (!userSnap.exists()) {
-            await setDoc(userRef, {
+        const unsubscribeUser = onSnapshot(userRef, (snap) => {
+          if (snap.exists()) {
+            setUserProfile(snap.data() as UserProfile);
+          } else {
+            const initialProfile = {
               uid: u.uid,
-              email: u.email,
-              displayName: u.displayName,
-              photoURL: u.photoURL,
+              email: u.email || '',
+              displayName: u.displayName || '',
+              photoURL: u.photoURL || '',
+              plan: 'free',
+              credits: 10,
               createdAt: serverTimestamp()
-            });
+            };
+            setDoc(userRef, initialProfile).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${u.uid}`));
           }
-        } catch (err) {
-          handleFirestoreError(err, OperationType.WRITE, `users/${u.uid}`);
-        }
+        }, (err) => handleFirestoreError(err, OperationType.GET, `users/${u.uid}`));
+        
+        return () => unsubscribeUser();
+      } else {
+        setUserProfile(null);
       }
     });
     return () => unsubscribe();
@@ -361,7 +462,8 @@ export default function App() {
         userId: user.uid,
         createdAt: serverTimestamp(),
       };
-      await addDoc(collection(db, 'productions'), prodData);
+      const docRef = await addDoc(collection(db, 'productions'), prodData);
+      setState(prev => ({ ...prev, id: docRef.id }));
       addLog('SYSTEM', 'Production saved to cloud.');
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, 'productions');
@@ -449,6 +551,24 @@ export default function App() {
       };
       updateDoc(productionRef, { musicSettings: sanitizedSettings })
         .catch(err => console.error("Error updating music settings:", err));
+    }
+  };
+
+  const handleSubscribe = async (priceId: string) => {
+    if (!user) return;
+    try {
+      const response = await fetch('/api/create-checkout-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ priceId, userId: user.uid })
+      });
+      const session = await response.json();
+      if (session.url) {
+        window.location.href = session.url;
+      }
+    } catch (err) {
+      console.error("Stripe Checkout Error:", err);
+      alert("Failed to initiate checkout. Please try again.");
     }
   };
 
@@ -544,6 +664,10 @@ export default function App() {
         Current Description: ${scene.description}
         Current Visual Prompt: ${scene.visualPrompt}
         
+        Adjacent Scenes:
+        - Previous Scene: ${sceneIndex > 0 ? state.storyboard[sceneIndex - 1].description : 'None (This is the first scene)'}
+        - Next Scene: ${sceneIndex < state.storyboard.length - 1 ? state.storyboard[sceneIndex + 1].description : 'None (This is the last scene)'}
+        
         Character Visual Identity: ${state.characterTokens}
         
         Return a JSON object with:
@@ -551,7 +675,8 @@ export default function App() {
         - visualPrompt: A highly detailed prompt for image generation. Focus on the visual composition, character actions, and environmental details. Incorporate the character's visual identity tokens where appropriate.
         - cameraMovement: Specific camera instructions (e.g., "Slow push-in", "Low-angle tracking shot").
         - lighting: Detailed lighting setup (e.g., "Moody chiaroscuro with blue rim light").
-        - soundDesignPrompt: Atmospheric sound and SFX cues.`,
+        - soundDesignPrompt: Atmospheric sound and SFX cues.
+        - transitionType: Suggest a cinematic transition from the PREVIOUS scene into this one, based on mood and visual flow. Choose from: 'Crossfade', 'Wipe', 'Dissolve', 'Cut', 'Zoom', 'Glitch', 'Morphing', 'Light Trails', 'Abstract Flows'.`,
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -562,8 +687,12 @@ export default function App() {
               cameraMovement: { type: GeminiType.STRING },
               lighting: { type: GeminiType.STRING },
               soundDesignPrompt: { type: GeminiType.STRING },
+              transitionType: { 
+                type: GeminiType.STRING, 
+                enum: ['Crossfade', 'Wipe', 'Dissolve', 'Cut', 'Zoom', 'Glitch', 'Morphing', 'Light Trails', 'Abstract Flows']
+              },
             },
-            required: ["description", "visualPrompt", "cameraMovement", "lighting", "soundDesignPrompt"]
+            required: ["description", "visualPrompt", "cameraMovement", "lighting", "soundDesignPrompt", "transitionType"]
           }
         }
       });
@@ -629,14 +758,21 @@ export default function App() {
 
   const startProduction = async () => {
     if (!input.concept) return;
-    if (!user) {
+    if (!user || !userProfile) {
       alert("Please sign in to start production.");
       return;
     }
 
+    // Credit check bypassed for Demo Mode
+    addLog('SYSTEM', 'Production initiated (Demo Mode: Credits Bypassed).');
+
+    const isPro = true; // Force Pro features in Demo Mode
+    const creativeModel = "gemini-3.1-pro-preview";
+
     setState(prev => ({
       ...prev,
       status: 'scripting',
+      plan: userProfile.plan,
       title: input.concept.slice(0, 30),
       isMusicVideoMode: input.isMusicVideoMode,
       logs: [`[EXECUTIVE PRODUCER] Initializing ${input.isMusicVideoMode ? 'MUSIC VIDEO' : 'CINEMATIC'} production for: ${input.concept}`]
@@ -646,10 +782,10 @@ export default function App() {
       let script = '';
       let lyrics = '';
 
-      // 1. SCRIPTWRITING / SONGWRITING (Using Pro with High Thinking for premium quality)
-      addLog('SCRIPTWRITER', 'Crafting narrative structure with Deep Reasoning Pro Intelligence...');
+      // 1. SCRIPTWRITING / SONGWRITING
+      addLog('SCRIPTWRITER', `Crafting narrative structure with Pro Intelligence (Demo Mode)...`);
       const scriptResponse = await generateContentWithRetry({
-        model: "gemini-3.1-pro-preview",
+        model: creativeModel,
         contents: `Act as a Hollywood Scriptwriter and Creative Director. 
         Create a detailed, high-fidelity ${input.isMusicVideoMode ? 'song structure and lyrics' : 'script'} for a ${input.duration} minute ${input.genre} video titled "${input.concept}". 
         Audience: ${input.audience}. 
@@ -659,7 +795,7 @@ export default function App() {
         Format as Markdown.`,
         config: {
           tools: [{ googleSearch: {} }],
-          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
+          ...(isPro ? { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } } : {})
         }
       });
       script = scriptResponse.text || '';
@@ -668,10 +804,10 @@ export default function App() {
       setState(prev => ({ ...prev, script, lyrics, status: 'storyboarding' }));
       addLog('SCRIPTWRITER', 'Script finalized with Grounded Intelligence.');
 
-      // 2. STORYBOARDING (Using Pro with High Thinking for premium quality)
-      addLog('STORYBOARD ARTIST', `Breaking down ${input.isMusicVideoMode ? 'lyrics' : 'script'} into visual scenes with Deep Reasoning...`);
+      // 2. STORYBOARDING
+      addLog('STORYBOARD ARTIST', `Breaking down ${input.isMusicVideoMode ? 'lyrics' : 'script'} into visual scenes...`);
       const storyboardResponse = await generateContentWithRetry({
-        model: "gemini-3.1-pro-preview",
+        model: creativeModel,
         contents: `Act as a Storyboard Artist. Based on this ${input.isMusicVideoMode ? 'lyrics' : 'script'}, create a scene-by-scene breakdown with high-fidelity visual descriptions.
         ${input.isMusicVideoMode ? 'MUSIC VIDEO MODE: Alternate between "Performance" and "Storytelling" scenes.' : ''}
         Content: ${script}
@@ -681,19 +817,19 @@ export default function App() {
         - ambiencePreset: 'None', 'Deep Space', 'Cyberpunk City', 'Ancient Forest', 'Underwater Abyss', 'Desert Wind', 'Industrial Factory'
         - sfxPreset: 'None', 'Laser Blast', 'Mechanical Whir', 'Digital Glitch', 'Explosion', 'Footsteps', 'Teleport'
         
-        CRITICAL: Select transitionType based on the mood:
-        - 'Morphing': Surreal, fluid transformations, or dream sequences.
-        - 'Light Trails': High speed, futuristic, or energetic movement.
-        - 'Abstract Flows': Artistic, organic, or ethereal shifts.
-        - 'Glitch': High energy, tech, chaos, or rapid shifts.
-        - 'Zoom': Immersive, deep focus, or entering new worlds.
-        - 'Wipe': Directional movement, passing time, or shifting locations.
-        - 'Dissolve': Emotional, dream-like, or slow transitions.
-        - 'Crossfade': Classic cinematic flow.
-        - 'Cut': Fast-paced action or standard narrative beats.`,
+        CRITICAL: Select transitionType based on the mood and the visual flow between adjacent scenes:
+        - 'Morphing': Use for surreal, fluid transformations, or dream sequences where one object becomes another.
+        - 'Light Trails': Use for high speed, futuristic, or energetic movement, connecting fast-paced action.
+        - 'Abstract Flows': Use for artistic, organic, or ethereal shifts, ideal for emotional or abstract storytelling.
+        - 'Glitch': Use for high energy, tech, chaos, or rapid shifts in digital/cyberpunk contexts.
+        - 'Zoom': Use for immersive, deep focus, or entering new worlds/details.
+        - 'Wipe': Use for directional movement, passing time, or shifting locations.
+        - 'Dissolve': Use for emotional, dream-like, or slow transitions.
+        - 'Crossfade': Use for classic cinematic flow between related scenes.
+        - 'Cut': Use for fast-paced action or standard narrative beats.`,
         config: {
           responseMimeType: "application/json",
-          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
+          ...(isPro ? { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } } : {}),
           responseSchema: {
             type: GeminiType.ARRAY,
             items: {
@@ -734,10 +870,10 @@ export default function App() {
       setState(prev => ({ ...prev, storyboard, status: 'designing_characters' }));
       addLog('STORYBOARD ARTIST', `Generated ${storyboard.length} scenes.`);
 
-      // 3. CHARACTER DESIGN (Using Pro with High Thinking for premium quality)
-      addLog('CHARACTER DESIGN', 'Defining visual identity tokens with Deep Reasoning...');
+      // 3. CHARACTER DESIGN
+      addLog('CHARACTER DESIGN', 'Defining visual identity tokens...');
       const characterResponse = await generateContentWithRetry({
-        model: "gemini-3.1-pro-preview",
+        model: creativeModel,
         contents: `Act as a Lead Character Designer. Analyze the following script and define the visual identity for the main characters.
         Script: ${script}
         
@@ -749,7 +885,7 @@ export default function App() {
         The goal is to provide a concise but highly descriptive prompt fragment that can be used to maintain visual consistency across different scenes.
         Return the tokens as a clear, descriptive text block.`,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
+          ...(isPro ? { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } } : {})
         }
       });
       const characterTokens = characterResponse.text || '';
@@ -881,6 +1017,11 @@ export default function App() {
               });
               const videoBlob = await videoRes.blob();
               const videoUrl = URL.createObjectURL(videoBlob);
+              
+              // Cache video asset locally for offline/faster preview
+              if (state.id) {
+                await storageService.saveAsset(`${state.id}_scene_${i}_video`, videoBlob);
+              }
               
               const endTime = Date.now();
               setState(prev => {
@@ -1077,6 +1218,35 @@ export default function App() {
                 </button>
               ))}
             </div>
+
+            <div className="p-4 border-t border-zinc-800/50 space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Download className="w-3 h-3 text-zinc-500" />
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Offline Cache</span>
+                </div>
+                <button 
+                  onClick={async () => {
+                    if (confirm('Clear all locally cached video assets?')) {
+                      await storageService.clearAll();
+                      window.location.reload();
+                    }
+                  }}
+                  className="text-[8px] font-black text-zinc-600 hover:text-red-500 uppercase tracking-tighter"
+                >
+                  Clear Cache
+                </button>
+              </div>
+              <div className="p-3 bg-zinc-900/50 border border-zinc-800 rounded-xl">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[9px] text-zinc-500 font-bold uppercase">Status</span>
+                  <span className="text-[9px] text-green-500 font-bold uppercase">Active</span>
+                </div>
+                <p className="text-[8px] text-zinc-600 leading-relaxed">
+                  Generated scenes are automatically stored in your browser's IndexedDB for instant playback in future sessions.
+                </p>
+              </div>
+            </div>
             {user && (
               <div className="p-4 border-t border-zinc-800/50 flex items-center gap-3">
                 <img src={user.photoURL || ''} className="w-8 h-8 rounded-full border border-zinc-700" />
@@ -1110,6 +1280,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4">
+            {/* Credits Badge Hidden in Demo Mode */}
             {!user ? (
               <button 
                 onClick={signInWithGoogle}
@@ -1564,6 +1735,7 @@ export default function App() {
                     { id: 'vfx', label: 'VFX', icon: Zap },
                     { id: 'post-production', label: 'Mastering', icon: Wand2 },
                     { id: 'chat', label: 'Assistant', icon: MessageSquare },
+                    // { id: 'pricing', label: 'Upgrade', icon: Zap },
                   ].map((tab) => (
                     <button
                       key={tab.id}
@@ -2455,6 +2627,76 @@ export default function App() {
                         >
                           <Send className="w-4 h-4" />
                         </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeTab === 'pricing' && (
+                    <div className="h-full overflow-y-auto pr-4 custom-scrollbar">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        {[
+                          { 
+                            name: 'Free', 
+                            price: '$0', 
+                            credits: '10', 
+                            features: ['Flash Models', '720p Resolution', 'Standard Support'],
+                            priceId: null,
+                            current: userProfile?.plan === 'free'
+                          },
+                          { 
+                            name: 'Pro', 
+                            price: '$29', 
+                            credits: '100', 
+                            features: ['Pro Models', '1080p Resolution', 'Priority Support', 'Custom Voices'],
+                            priceId: 'price_pro_id', // Replace with real Stripe Price ID
+                            current: userProfile?.plan === 'pro'
+                          },
+                          { 
+                            name: 'Enterprise', 
+                            price: '$99', 
+                            credits: '500', 
+                            features: ['Pro Models', '4K Resolution', 'Dedicated Support', 'API Access'],
+                            priceId: 'price_ent_id', // Replace with real Stripe Price ID
+                            current: userProfile?.plan === 'enterprise'
+                          }
+                        ].map((tier) => (
+                          <div key={tier.name} className={cn(
+                            "p-6 rounded-3xl border flex flex-col gap-6 transition-all",
+                            tier.current ? "bg-amber-500/10 border-amber-500/50" : "bg-black/50 border-zinc-800 hover:border-zinc-700"
+                          )}>
+                            <div className="space-y-1">
+                              <h3 className="text-sm font-black uppercase tracking-widest text-white">{tier.name}</h3>
+                              <div className="flex items-baseline gap-1">
+                                <span className="text-2xl font-black text-white">{tier.price}</span>
+                                <span className="text-[10px] text-zinc-500 uppercase font-bold">/month</span>
+                              </div>
+                            </div>
+                            <div className="space-y-3 flex-1">
+                              <div className="flex items-center gap-2 text-amber-500">
+                                <Zap className="w-3.5 h-3.5" />
+                                <span className="text-[10px] font-black uppercase tracking-widest">{tier.credits} Credits</span>
+                              </div>
+                              <ul className="space-y-2">
+                                {tier.features.map(f => (
+                                  <li key={f} className="flex items-center gap-2 text-[10px] text-zinc-400">
+                                    <CheckCircle2 className="w-3 h-3 text-zinc-600" />
+                                    {f}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                            <button 
+                              onClick={() => tier.priceId && handleSubscribe(tier.priceId)}
+                              disabled={tier.current || !tier.priceId}
+                              className={cn(
+                                "w-full py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                                tier.current ? "bg-zinc-800 text-zinc-500 cursor-default" : "bg-white text-black hover:scale-[1.02]"
+                              )}
+                            >
+                              {tier.current ? 'Current Plan' : tier.priceId ? 'Upgrade Now' : 'Free Tier'}
+                            </button>
+                          </div>
+                        ))}
                       </div>
                     </div>
                   )}
