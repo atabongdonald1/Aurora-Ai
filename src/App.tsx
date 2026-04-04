@@ -1283,7 +1283,12 @@ export default function App() {
             {/* Credits Badge Hidden in Demo Mode */}
             {!user ? (
               <button 
-                onClick={signInWithGoogle}
+                onClick={() => {
+                  signInWithGoogle().catch(err => {
+                    console.error("Sign-in error:", err);
+                    alert(`Sign-in failed: ${err.message}. Please ensure your Vercel domain is added to the "Authorized domains" list in the Firebase Console (Authentication > Settings).`);
+                  });
+                }}
                 className="px-4 py-2 bg-white text-black text-xs font-bold rounded-full flex items-center gap-2 hover:bg-zinc-200 transition-all"
               >
                 <LogIn className="w-4 h-4" />
